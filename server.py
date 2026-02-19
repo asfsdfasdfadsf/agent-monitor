@@ -130,6 +130,105 @@ def get_usage():
         return usage_cache.get("data")
 
 
+# Conversation cache
+convo_cache = {"data": None, "mtime": 0, "last_check": 0}
+CONVO_CACHE_TTL = 2
+
+
+def get_conversation():
+    """Read transcript JSONL and extract user/assistant messages."""
+    now = time.time()
+    if now - convo_cache["last_check"] < CONVO_CACHE_TTL and convo_cache["data"] is not None:
+        return convo_cache["data"]
+
+    convo_cache["last_check"] = now
+    tp = transcript_path
+    if not tp or not os.path.isfile(tp):
+        return None
+
+    try:
+        mtime = os.path.getmtime(tp)
+        if mtime == convo_cache["mtime"] and convo_cache["data"] is not None:
+            return convo_cache["data"]
+
+        messages = []
+        seen_uuids = {}  # track latest version of each message by uuid
+
+        with open(tp, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                msg = obj.get("message") or {}
+                role = msg.get("role")
+                uuid = obj.get("uuid")
+                ts = obj.get("timestamp")
+
+                if role == "user" and obj.get("type") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and content.strip():
+                        entry = {
+                            "role": "user",
+                            "text": content.strip(),
+                            "timestamp": ts,
+                            "uuid": uuid,
+                        }
+                        if uuid:
+                            seen_uuids[uuid] = entry
+                        else:
+                            messages.append(entry)
+
+                elif role == "assistant":
+                    # Extract text blocks from content array
+                    content = msg.get("content", [])
+                    text_parts = []
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict):
+                                if block.get("type") == "text" and block.get("text", "").strip():
+                                    text_parts.append(block["text"].strip())
+                    if text_parts:
+                        full_text = "\n\n".join(text_parts)
+                        entry = {
+                            "role": "assistant",
+                            "text": full_text,
+                            "timestamp": ts,
+                            "uuid": uuid,
+                        }
+                        if uuid:
+                            seen_uuids[uuid] = entry
+                        else:
+                            messages.append(entry)
+
+        # Build final list from seen_uuids (keeps last version of each)
+        # plus any messages without uuids
+        uuid_msgs = sorted(seen_uuids.values(), key=lambda m: m.get("timestamp") or "")
+        all_msgs = uuid_msgs + messages
+        all_msgs.sort(key=lambda m: m.get("timestamp") or "")
+
+        # Deduplicate by keeping only the latest entry per uuid
+        result = []
+        seen = set()
+        for m in all_msgs:
+            uid = m.get("uuid")
+            if uid:
+                if uid in seen:
+                    continue
+                seen.add(uid)
+            result.append(m)
+
+        convo_cache["data"] = result
+        convo_cache["mtime"] = mtime
+        return result
+    except Exception:
+        return convo_cache.get("data")
+
+
 class Handler(SimpleHTTPRequestHandler):
     """Handles static files, the /event POST endpoint, and /api/* endpoints."""
 
@@ -194,6 +293,13 @@ class Handler(SimpleHTTPRequestHandler):
             usage = get_usage()
             if usage:
                 self.send_json(usage)
+            else:
+                self.send_json({"error": "no transcript found yet"}, 404)
+            return
+        if self.path == "/api/conversation":
+            convo = get_conversation()
+            if convo is not None:
+                self.send_json({"messages": convo})
             else:
                 self.send_json({"error": "no transcript found yet"}, 404)
             return
