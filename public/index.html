@@ -320,6 +320,38 @@
   .stat-card { background: var(--bg-tertiary); border-radius: 8px; padding: 8px; text-align: center; }
   .stat-card-value { font-size: 18px; font-weight: 800; color: var(--text-primary); }
   .stat-card-label { font-size: 9px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-top: 2px; }
+  /* ── Usage Meter ──────────────────────────── */
+  .usage-section { padding: 10px 14px; }
+  .usage-ring-row { display: flex; align-items: center; gap: 14px; margin-bottom: 10px; }
+  .usage-ring-wrap { position: relative; width: 72px; height: 72px; flex-shrink: 0; }
+  .usage-ring-wrap svg { transform: rotate(-90deg); }
+  .usage-ring-bg { fill: none; stroke: var(--bg-primary); stroke-width: 6; }
+  .usage-ring-fill { fill: none; stroke-width: 6; stroke-linecap: round; transition: stroke-dashoffset 0.6s ease; }
+  .usage-ring-center {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+  }
+  .usage-ring-value { font-size: 14px; font-weight: 800; color: var(--text-primary); line-height: 1; }
+  .usage-ring-unit { font-size: 8px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .usage-breakdown { flex: 1; min-width: 0; }
+  .usage-row {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 10px; padding: 2px 0; border-bottom: 1px solid rgba(48,54,61,0.3);
+  }
+  .usage-row:last-child { border-bottom: none; }
+  .usage-row-label { color: var(--text-secondary); }
+  .usage-row-value { color: var(--text-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .usage-model-badge {
+    display: inline-block; font-size: 9px; padding: 2px 8px; border-radius: 4px;
+    background: rgba(88,166,255,0.1); color: var(--accent-blue); font-weight: 600;
+    letter-spacing: 0.3px;
+  }
+  .usage-cost {
+    font-size: 18px; font-weight: 800; color: var(--accent-green);
+    text-align: center; margin-top: 4px;
+  }
+  .usage-cost-label { font-size: 9px; color: var(--text-muted); text-transform: uppercase; text-align: center; }
+
   .tool-bar-chart { padding: 8px 14px; }
   .tool-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; font-size: 11px; }
   .tool-bar-name { width: 65px; text-align: right; color: var(--text-secondary); flex-shrink: 0; font-size: 10px; }
@@ -380,6 +412,10 @@
       <div class="stat-card"><div class="stat-card-value" id="sc-writes">0</div><div class="stat-card-label">Writes</div></div>
       <div class="stat-card"><div class="stat-card-value" id="sc-bash">0</div><div class="stat-card-label">Commands</div></div>
       <div class="stat-card"><div class="stat-card-value" id="sc-searches">0</div><div class="stat-card-label">Searches</div></div>
+    </div>
+    <div class="panel-header">Token Usage</div>
+    <div class="usage-section" id="usage-section">
+      <div style="text-align:center;color:var(--text-muted);font-size:11px;padding:8px 0;">Waiting for data...</div>
     </div>
     <div class="panel-header">Tool Usage</div>
     <div class="tool-bar-chart" id="tool-chart"></div>
@@ -823,6 +859,107 @@ function formatTime(ts) { return new Date(ts).toLocaleTimeString([],{hour:'2-dig
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function trunc(s, max) { return s.length > max ? s.slice(0,max)+'\n...(truncated)' : s; }
 
+// ── Token Usage ─────────────────────────────
+const TOKEN_PRICES = {
+  // per million tokens (USD)
+  'claude-opus-4-6':   { input: 15, output: 75, cache_write: 18.75, cache_read: 1.50 },
+  'claude-sonnet-4-6': { input: 3,  output: 15, cache_write: 3.75,  cache_read: 0.30 },
+  'claude-haiku-4-5':  { input: 0.80, output: 4, cache_write: 1.00, cache_read: 0.08 },
+};
+
+function getPrice(model) {
+  if (!model) return TOKEN_PRICES['claude-opus-4-6'];
+  for (const key of Object.keys(TOKEN_PRICES)) {
+    if (model.startsWith(key) || model.includes(key)) return TOKEN_PRICES[key];
+  }
+  if (model.includes('opus')) return TOKEN_PRICES['claude-opus-4-6'];
+  if (model.includes('sonnet')) return TOKEN_PRICES['claude-sonnet-4-6'];
+  if (model.includes('haiku')) return TOKEN_PRICES['claude-haiku-4-5'];
+  return TOKEN_PRICES['claude-opus-4-6'];
+}
+
+function fmtTokens(n) {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
+  return String(n);
+}
+
+let lastUsage = null;
+
+async function fetchUsage() {
+  try {
+    const res = await fetch('/api/usage');
+    if (!res.ok) return;
+    lastUsage = await res.json();
+    renderUsage();
+  } catch(e) {}
+}
+
+function renderUsage() {
+  const el = document.getElementById('usage-section');
+  if (!lastUsage || lastUsage.error) {
+    el.innerHTML = '<div style="text-align:center;color:var(--text-muted);font-size:11px;padding:8px 0;">Waiting for data...</div>';
+    return;
+  }
+  const u = lastUsage;
+  const prices = getPrice(u.model);
+
+  // Calculate cost
+  const cost = (
+    (u.input_tokens / 1_000_000) * prices.input +
+    (u.output_tokens / 1_000_000) * prices.output +
+    (u.cache_creation_input_tokens / 1_000_000) * prices.cache_write +
+    (u.cache_read_input_tokens / 1_000_000) * prices.cache_read
+  );
+
+  // Ring: output tokens as proportion of total (visual indicator)
+  const outPct = u.total_tokens > 0 ? Math.min((u.output_tokens / u.total_tokens) * 100, 100) : 0;
+  const circumference = 2 * Math.PI * 30;
+  const inOffset = circumference - (circumference * Math.min(((u.input_tokens + u.cache_creation_input_tokens) / Math.max(u.total_tokens,1)) * 100, 100) / 100);
+  const outOffset = circumference - (circumference * outPct / 100);
+  const cacheOffset = circumference - (circumference * Math.min((u.cache_read_input_tokens / Math.max(u.total_tokens,1)) * 100, 100) / 100);
+
+  const modelShort = u.model ? u.model.replace('claude-', '').replace(/-\d{8}$/, '') : 'unknown';
+
+  el.innerHTML = `
+    <div class="usage-ring-row">
+      <div class="usage-ring-wrap">
+        <svg width="72" height="72" viewBox="0 0 72 72">
+          <circle class="usage-ring-bg" cx="36" cy="36" r="30"/>
+          <circle class="usage-ring-fill" cx="36" cy="36" r="30"
+            stroke="var(--accent-purple)"
+            stroke-dasharray="${circumference}"
+            stroke-dashoffset="${cacheOffset}"/>
+          <circle class="usage-ring-fill" cx="36" cy="36" r="24"
+            stroke="var(--accent-blue)" stroke-width="5"
+            stroke-dasharray="${circumference * 24/30}"
+            stroke-dashoffset="${(circumference * 24/30) - ((circumference * 24/30) * Math.min(((u.input_tokens + u.cache_creation_input_tokens) / Math.max(u.total_tokens,1)) * 100, 100) / 100)}"/>
+          <circle class="usage-ring-fill" cx="36" cy="36" r="18"
+            stroke="var(--accent-green)" stroke-width="4"
+            stroke-dasharray="${circumference * 18/30}"
+            stroke-dashoffset="${(circumference * 18/30) - ((circumference * 18/30) * outPct / 100)}"/>
+        </svg>
+        <div class="usage-ring-center">
+          <div class="usage-ring-value">${fmtTokens(u.total_tokens)}</div>
+          <div class="usage-ring-unit">tokens</div>
+        </div>
+      </div>
+      <div class="usage-breakdown">
+        <div class="usage-row"><span class="usage-row-label" style="color:var(--accent-blue);">Input</span><span class="usage-row-value">${fmtTokens(u.input_tokens)}</span></div>
+        <div class="usage-row"><span class="usage-row-label" style="color:var(--accent-green);">Output</span><span class="usage-row-value">${fmtTokens(u.output_tokens)}</span></div>
+        <div class="usage-row"><span class="usage-row-label" style="color:var(--accent-purple);">Cache read</span><span class="usage-row-value">${fmtTokens(u.cache_read_input_tokens)}</span></div>
+        <div class="usage-row"><span class="usage-row-label" style="color:var(--accent-orange);">Cache write</span><span class="usage-row-value">${fmtTokens(u.cache_creation_input_tokens)}</span></div>
+        <div class="usage-row"><span class="usage-row-label">API calls</span><span class="usage-row-value">${u.api_messages}</span></div>
+      </div>
+    </div>
+    <div style="text-align:center;">
+      <span class="usage-model-badge">${esc(modelShort)}</span>
+    </div>
+    <div class="usage-cost">$${cost.toFixed(2)}</div>
+    <div class="usage-cost-label">Est. session cost</div>
+  `;
+}
+
 setInterval(() => {
   if (sessionStart) {
     const secs = Math.floor((Date.now()-sessionStart)/1000);
@@ -831,7 +968,11 @@ setInterval(() => {
   }
 }, 1000);
 
+// Poll usage every 3 seconds
+setInterval(fetchUsage, 3000);
+
 connect();
+fetchUsage();
 </script>
 </body>
 </html>
